@@ -3,7 +3,7 @@
  * Plugin Name: Bulk Page Creation
  * Plugin URI: https://ashikhosen.com
  * Description: Create WordPress pages and unlimited nested parent/child page structures from simple text.
- * Version: 3.0.0
+ * Version: 4.0.0
  * Author: Ashik Hosen
  * Author URI: https://ashikhosen.com
  * License: GPL-2.0-or-later
@@ -40,13 +40,13 @@ final class Ash_Bulk_Page_Creation {
 		);
 
 		add_action(
-			'wp_ajax_ash_bpc_create',
-			array( $this, 'ajax_create' )
+			'wp_ajax_ash_bpc_create_one',
+			array( $this, 'ajax_create_one' )
 		);
 	}
 
 	/**
-	 * Plugin Settings link.
+	 * Plugin settings link.
 	 */
 	public function plugin_action_links( $links ) {
 
@@ -101,7 +101,7 @@ final class Ash_Bulk_Page_Creation {
 	}
 
 	/**
-	 * Parse hierarchy.
+	 * Parse text structure.
 	 */
 	private function parse_input( $input ) {
 
@@ -123,7 +123,13 @@ final class Ash_Bulk_Page_Creation {
 				continue;
 			}
 
-			if ( ! preg_match( '/^(-*)(?:\s*)(.*?)\s*$/', $line, $matches ) ) {
+			if (
+				! preg_match(
+					'/^(-*)(?:\s*)(.*?)\s*$/',
+					$line,
+					$matches
+				)
+			) {
 				continue;
 			}
 
@@ -161,7 +167,10 @@ final class Ash_Bulk_Page_Creation {
 
 			$level = $item['level'];
 
-			if ( $level > 0 && ! isset( $parents[ $level - 1 ] ) ) {
+			if (
+				$level > 0 &&
+				! isset( $parents[ $level - 1 ] )
+			) {
 
 				$errors[] = sprintf(
 					'Line %d ("%s") has no valid parent.',
@@ -177,7 +186,9 @@ final class Ash_Bulk_Page_Creation {
 			foreach ( $parents as $stored_level => $stored_index ) {
 
 				if ( $stored_level > $level ) {
-					unset( $parents[ $stored_level ] );
+					unset(
+						$parents[ $stored_level ]
+					);
 				}
 			}
 		}
@@ -186,7 +197,7 @@ final class Ash_Bulk_Page_Creation {
 	}
 
 	/**
-	 * Find existing page by title.
+	 * Find existing page.
 	 */
 	private function find_existing_page( $title ) {
 
@@ -218,7 +229,7 @@ final class Ash_Bulk_Page_Creation {
 	}
 
 	/**
-	 * Find all existing pages before creation.
+	 * Get all existing pages.
 	 */
 	private function get_existing_items( $items ) {
 
@@ -248,7 +259,7 @@ final class Ash_Bulk_Page_Creation {
 	}
 
 	/**
-	 * AJAX preflight.
+	 * Preflight.
 	 */
 	public function ajax_preflight() {
 
@@ -293,20 +304,27 @@ final class Ash_Bulk_Page_Creation {
 			);
 		}
 
-		$existing = $this->get_existing_items( $items );
+		$existing =
+			$this->get_existing_items(
+				$items
+			);
 
 		wp_send_json_success(
 			array(
 				'total'    => count( $items ),
+				'items'    => $items,
 				'existing' => $existing,
 			)
 		);
 	}
 
 	/**
-	 * AJAX create.
+	 * Create exactly ONE page.
+	 *
+	 * The browser calls this once for every page.
+	 * This is what makes the progressive loader real.
 	 */
-	public function ajax_create() {
+	public function ajax_create_one() {
 
 		if ( ! current_user_can( 'manage_options' ) ) {
 
@@ -323,11 +341,27 @@ final class Ash_Bulk_Page_Creation {
 			'nonce'
 		);
 
-		$input = isset( $_POST['content'] )
-			? wp_unslash( $_POST['content'] )
+		if ( function_exists( 'set_time_limit' ) ) {
+			@set_time_limit( 60 );
+		}
+
+		$title = isset( $_POST['title'] )
+			? sanitize_text_field(
+				wp_unslash(
+					$_POST['title']
+				)
+			)
 			: '';
 
-		$conflict_action = isset( $_POST['conflict_action'] )
+		$parent_id = isset( $_POST['parent_id'] )
+			? absint(
+				$_POST['parent_id']
+			)
+			: 0;
+
+		$conflict_action = isset(
+			$_POST['conflict_action']
+		)
 			? sanitize_key(
 				wp_unslash(
 					$_POST['conflict_action']
@@ -335,206 +369,115 @@ final class Ash_Bulk_Page_Creation {
 			)
 			: 'skip';
 
-		$allowed_actions = array(
-			'replace',
-			'skip',
-			'duplicate',
-		);
+		if ( '' === $title ) {
 
-		if ( ! in_array( $conflict_action, $allowed_actions, true ) ) {
+			wp_send_json_error(
+				array(
+					'message' => 'Page title is empty.',
+				)
+			);
+		}
+
+		if (
+			! in_array(
+				$conflict_action,
+				array(
+					'replace',
+					'skip',
+					'duplicate',
+				),
+				true
+			)
+		) {
+
 			$conflict_action = 'skip';
 		}
 
-		$items = $this->parse_input( $input );
-
-		if ( empty( $items ) ) {
-
-			wp_send_json_error(
-				array(
-					'message' => 'No pages found.',
-				)
+		$existing =
+			$this->find_existing_page(
+				$title
 			);
-		}
-
-		$errors = $this->validate_items( $items );
-
-		if ( ! empty( $errors ) ) {
-
-			wp_send_json_error(
-				array(
-					'message' => implode( "\n", $errors ),
-				)
-			);
-		}
 
 		/*
-		 * Increase execution time when possible.
-		 * This helps with large page trees.
+		 * Existing page.
 		 */
-		if ( function_exists( 'set_time_limit' ) ) {
-			@set_time_limit( 120 );
-		}
-
-		$parents = array();
-
-		$created = array();
-
-		$skipped = array();
-
-		$replaced = array();
-
-		$duplicated = array();
-
-		$failed = array();
-
-		foreach ( $items as $index => $item ) {
-
-			$level = $item['level'];
-
-			$title = $item['title'];
+		if ( $existing ) {
 
 			/*
-			 * Determine parent from the previously
-			 * processed hierarchy level.
+			 * Replace.
 			 */
-			$parent_id = 0;
+			if ( 'replace' === $conflict_action ) {
 
-			$parent_title = '';
-
-			if ( $level > 0 ) {
-
-				if ( ! isset( $parents[ $level - 1 ] ) ) {
-
-					$failed[] = array(
-						'title'   => $title,
-						'message' => 'Parent page could not be determined.',
-					);
-
-					continue;
-				}
-
-				$parent_id =
-					(int) $parents[ $level - 1 ]['id'];
-
-				$parent_title =
-					$parents[ $level - 1 ]['title'];
-			}
-
-			/*
-			 * Find an existing page with this title.
-			 */
-			$existing =
-				$this->find_existing_page(
-					$title
+				$updated = wp_update_post(
+					wp_slash(
+						array(
+							'ID'          => $existing->ID,
+							'post_title'  => $title,
+							'post_parent' => $parent_id,
+							'post_status' => 'publish',
+							'post_type'   => 'page',
+						)
+					),
+					true
 				);
 
-			$page_id = 0;
+				if ( is_wp_error( $updated ) ) {
 
-			/*
-			 * =====================================================
-			 * EXISTING PAGE
-			 * =====================================================
-			 */
-			if ( $existing ) {
-
-				/*
-				 * REPLACE
-				 */
-				if ( 'replace' === $conflict_action ) {
-
-					$update = array(
-						'ID'          => $existing->ID,
-						'post_title'  => $title,
-						'post_parent' => $parent_id,
-						'post_status' => 'publish',
-						'post_type'   => 'page',
-					);
-
-					$updated = wp_update_post(
-						wp_slash( $update ),
-						true
-					);
-
-					if ( is_wp_error( $updated ) ) {
-
-						$failed[] = array(
-							'title'   => $title,
-							'message' => $updated->get_error_message(),
-						);
-
-						continue;
-					}
-
-					$page_id = (int) $existing->ID;
-
-					$replaced[] = array(
-						'title'  => $title,
-						'id'     => $page_id,
-						'parent' => $parent_title,
-						'url'    => get_permalink( $page_id ),
+					wp_send_json_error(
+						array(
+							'message' =>
+								$updated->get_error_message(),
+						)
 					);
 				}
 
-				/*
-				 * SKIP
-				 */
-				elseif ( 'skip' === $conflict_action ) {
-
-					$page_id = (int) $existing->ID;
-
-					$skipped[] = array(
-						'title'  => $title,
-						'id'     => $page_id,
-						'parent' => $parent_title,
-						'url'    => get_permalink( $page_id ),
-					);
-				}
-
-				/*
-				 * DUPLICATE
-				 */
-				else {
-
-					$new_page = wp_insert_post(
-						wp_slash(
-							array(
-								'post_title'  => $title,
-								'post_content' => '',
-								'post_status' => 'publish',
-								'post_type'   => 'page',
-								'post_parent' => $parent_id,
-							)
+				wp_send_json_success(
+					array(
+						'action'     => 'replaced',
+						'id'         => (int) $existing->ID,
+						'title'      => get_the_title(
+							$existing->ID
 						),
-						true
-					);
-
-					if ( is_wp_error( $new_page ) ) {
-
-						$failed[] = array(
-							'title'   => $title,
-							'message' => $new_page->get_error_message(),
-						);
-
-						continue;
-					}
-
-					$page_id = (int) $new_page;
-
-					$duplicated[] = array(
-						'title'  => get_the_title( $page_id ),
-						'id'     => $page_id,
-						'parent' => $parent_title,
-						'url'    => get_permalink( $page_id ),
-					);
-				}
+						'parent_id'  => $parent_id,
+						'url'        => get_permalink(
+							$existing->ID
+						),
+						'message'    => 'Page replaced successfully.',
+					)
+				);
 			}
 
 			/*
-			 * =====================================================
-			 * NEW PAGE
-			 * =====================================================
+			 * Skip.
+			 *
+			 * IMPORTANT:
+			 * The existing page ID is returned so children can
+			 * still correctly attach to this page.
 			 */
-			else {
+			if ( 'skip' === $conflict_action ) {
+
+				wp_send_json_success(
+					array(
+						'action'     => 'skipped',
+						'id'         => (int) $existing->ID,
+						'title'      => get_the_title(
+							$existing->ID
+						),
+						'parent_id'  => $parent_id,
+						'url'        => get_permalink(
+							$existing->ID
+						),
+						'message'    => 'Existing page skipped.',
+					)
+				);
+			}
+
+			/*
+			 * Duplicate.
+			 *
+			 * WordPress automatically generates a unique slug.
+			 */
+			if ( 'duplicate' === $conflict_action ) {
 
 				$new_page = wp_insert_post(
 					wp_slash(
@@ -551,61 +494,75 @@ final class Ash_Bulk_Page_Creation {
 
 				if ( is_wp_error( $new_page ) ) {
 
-					$failed[] = array(
-						'title'   => $title,
-						'message' => $new_page->get_error_message(),
+					wp_send_json_error(
+						array(
+							'message' =>
+								$new_page->get_error_message(),
+						)
 					);
-
-					continue;
 				}
 
-				$page_id = (int) $new_page;
-
-				$created[] = array(
-					'title'  => $title,
-					'id'     => $page_id,
-					'parent' => $parent_title,
-					'url'    => get_permalink( $page_id ),
+				wp_send_json_success(
+					array(
+						'action'     => 'duplicated',
+						'id'         => (int) $new_page,
+						'title'      => get_the_title(
+							$new_page
+						),
+						'parent_id'  => $parent_id,
+						'url'        => get_permalink(
+							$new_page
+						),
+						'message'    => 'Page duplicated successfully.',
+					)
 				);
 			}
+		}
 
-			/*
-			 * Store the page at its hierarchy level.
-			 *
-			 * This is critical for nested structures.
-			 */
-			$parents[ $level ] = array(
-				'id'    => $page_id,
-				'title' => $title,
+		/*
+		 * New page.
+		 */
+		$new_page = wp_insert_post(
+			wp_slash(
+				array(
+					'post_title'   => $title,
+					'post_content' => '',
+					'post_status'  => 'publish',
+					'post_type'    => 'page',
+					'post_parent'  => $parent_id,
+				)
+			),
+			true
+		);
+
+		if ( is_wp_error( $new_page ) ) {
+
+			wp_send_json_error(
+				array(
+					'message' =>
+						$new_page->get_error_message(),
+				)
 			);
-
-			/*
-			 * Remove deeper hierarchy levels.
-			 */
-			foreach ( $parents as $stored_level => $stored_page ) {
-
-				if ( $stored_level > $level ) {
-					unset(
-						$parents[ $stored_level ]
-					);
-				}
-			}
 		}
 
 		wp_send_json_success(
 			array(
-				'total'      => count( $items ),
-				'created'    => $created,
-				'replaced'   => $replaced,
-				'skipped'    => $skipped,
-				'duplicated' => $duplicated,
-				'failed'     => $failed,
+				'action'     => 'created',
+				'id'         => (int) $new_page,
+				'title'      => get_the_title(
+					$new_page
+				),
+				'parent_id'  => $parent_id,
+				'url'        => get_permalink(
+					$new_page
+				),
+				'message'    => 'Page created successfully.',
 			)
 		);
 	}
 
 	/**
-	 * Render admin page.
+	 * Admin page.
 	 */
 	public function render_page() {
 
@@ -618,8 +575,6 @@ final class Ash_Bulk_Page_Creation {
 		<div class="ash-bpc-wrap">
 
 			<div class="ash-bpc-container">
-
-				<!-- Header -->
 
 				<div class="ash-bpc-header">
 
@@ -644,8 +599,6 @@ final class Ash_Bulk_Page_Creation {
 
 				</div>
 
-
-				<!-- Main Card -->
 
 				<div class="ash-bpc-card">
 
@@ -697,6 +650,7 @@ final class Ash_Bulk_Page_Creation {
 -- WordPress
 --- Elementor
 --- Bricks
+-- LMS
 - Case Studies
 About
 Contact"
@@ -705,8 +659,6 @@ Contact"
 
 					</div>
 
-
-					<!-- How it works -->
 
 					<div class="ash-bpc-help">
 
@@ -739,38 +691,23 @@ Contact"
 						<div class="ash-bpc-examples">
 
 							<div class="ash-bpc-example">
-
 								<code>Work</code>
-
 								<span>Top-level page</span>
-
 							</div>
 
-
 							<div class="ash-bpc-example">
-
 								<code>- Portfolio</code>
-
 								<span>Child of Work</span>
-
 							</div>
 
-
 							<div class="ash-bpc-example">
-
 								<code>-- WordPress</code>
-
 								<span>Child of Portfolio</span>
-
 							</div>
 
-
 							<div class="ash-bpc-example">
-
 								<code>--- Elementor</code>
-
 								<span>Child of WordPress</span>
-
 							</div>
 
 						</div>
@@ -785,8 +722,6 @@ Contact"
 
 					</div>
 
-
-					<!-- Actions -->
 
 					<div class="ash-bpc-actions">
 
@@ -902,7 +837,7 @@ Contact"
 			</div>
 
 
-			<!-- Conflict Modal -->
+			<!-- Existing pages modal -->
 
 			<div
 				class="ash-bpc-modal-overlay"
@@ -1004,25 +939,168 @@ Contact"
 			</div>
 
 
-			<!-- Loading -->
+			<!-- Progressive loader -->
 
 			<div
-				class="ash-bpc-loading"
-				id="ash-bpc-loading"
+				class="ash-bpc-progress-overlay"
+				id="ash-bpc-progress-overlay"
 				style="display:none;"
 			>
 
-				<div class="ash-bpc-loading-box">
+				<div class="ash-bpc-progress-box">
 
-					<div class="ash-bpc-spinner"></div>
+					<div class="ash-bpc-progress-header">
 
-					<strong id="ash-bpc-loading-title">
-						Creating Pages
-					</strong>
+						<div class="ash-bpc-progress-main-icon">
+							<span class="dashicons dashicons-admin-page"></span>
+						</div>
 
-					<span id="ash-bpc-loading-text">
-						Please wait...
-					</span>
+						<div>
+
+							<h2 id="ash-bpc-progress-title">
+								Creating Pages
+							</h2>
+
+							<p id="ash-bpc-progress-subtitle">
+								Please wait while your pages are created.
+							</p>
+
+						</div>
+
+					</div>
+
+
+					<div class="ash-bpc-progress-steps">
+
+						<div
+							class="ash-bpc-progress-step"
+							id="ash-bpc-step-starting"
+						>
+
+							<div class="ash-bpc-step-marker">
+								<span class="dashicons dashicons-minus"></span>
+							</div>
+
+							<div class="ash-bpc-step-content">
+
+								<strong>Starting</strong>
+
+								<span>
+									Preparing your page structure
+								</span>
+
+							</div>
+
+						</div>
+
+
+						<div
+							class="ash-bpc-progress-step"
+							id="ash-bpc-step-checking"
+						>
+
+							<div class="ash-bpc-step-marker">
+								<span class="dashicons dashicons-minus"></span>
+							</div>
+
+							<div class="ash-bpc-step-content">
+
+								<strong>Checking Pages</strong>
+
+								<span>
+									Checking existing pages
+								</span>
+
+							</div>
+
+						</div>
+
+
+						<div
+							class="ash-bpc-progress-step"
+							id="ash-bpc-step-creating"
+						>
+
+							<div class="ash-bpc-step-marker">
+								<span class="dashicons dashicons-minus"></span>
+							</div>
+
+							<div class="ash-bpc-step-content">
+
+								<strong>Creating Pages</strong>
+
+								<span
+									id="ash-bpc-current-page"
+								>
+									Waiting...
+								</span>
+
+							</div>
+
+						</div>
+
+
+						<div
+							class="ash-bpc-progress-pages"
+							id="ash-bpc-progress-pages"
+						></div>
+
+
+						<div
+							class="ash-bpc-progress-step"
+							id="ash-bpc-step-completed"
+						>
+
+							<div class="ash-bpc-step-marker">
+								<span class="dashicons dashicons-minus"></span>
+							</div>
+
+							<div class="ash-bpc-step-content">
+
+								<strong>Completed</strong>
+
+								<span
+									id="ash-bpc-completed-text"
+								>
+									Waiting for creation to finish
+								</span>
+
+							</div>
+
+						</div>
+
+					</div>
+
+
+					<div class="ash-bpc-progress-bar-wrap">
+
+						<div class="ash-bpc-progress-bar">
+
+							<div
+								class="ash-bpc-progress-bar-fill"
+								id="ash-bpc-progress-bar-fill"
+							></div>
+
+						</div>
+
+
+						<div class="ash-bpc-progress-counter">
+
+							<span id="ash-bpc-progress-number">
+								0
+							</span>
+
+							/
+
+							<span id="ash-bpc-progress-total">
+								0
+							</span>
+
+							pages
+
+						</div>
+
+					</div>
 
 				</div>
 
@@ -1033,9 +1111,9 @@ Contact"
 
 		<style>
 
-			/* =========================================================
-			 * Base
-			 * ========================================================= */
+			/* =====================================================
+			 * BASE
+			 * ===================================================== */
 
 			.ash-bpc-wrap {
 				margin: 0 20px 0 0;
@@ -1054,9 +1132,9 @@ Contact"
 			}
 
 
-			/* =========================================================
-			 * Header
-			 * ========================================================= */
+			/* =====================================================
+			 * HEADER
+			 * ===================================================== */
 
 			.ash-bpc-header {
 				margin-bottom: 24px;
@@ -1100,9 +1178,9 @@ Contact"
 			}
 
 
-			/* =========================================================
-			 * Card
-			 * ========================================================= */
+			/* =====================================================
+			 * CARD
+			 * ===================================================== */
 
 			.ash-bpc-card {
 				background: #fff;
@@ -1154,9 +1232,9 @@ Contact"
 			}
 
 
-			/* =========================================================
-			 * Editor
-			 * ========================================================= */
+			/* =====================================================
+			 * EDITOR
+			 * ===================================================== */
 
 			.ash-bpc-editor {
 				margin: 24px;
@@ -1203,14 +1281,10 @@ Contact"
 				box-shadow: inset 0 0 0 1px #2271b1;
 			}
 
-			#ash-bpc-content::placeholder {
-				color: #a7aaad;
-			}
 
-
-			/* =========================================================
-			 * Help
-			 * ========================================================= */
+			/* =====================================================
+			 * HELP
+			 * ===================================================== */
 
 			.ash-bpc-help {
 				margin: 0 24px 24px;
@@ -1238,7 +1312,6 @@ Contact"
 
 			.ash-bpc-help-title .dashicons {
 				color: #2271b1;
-				font-size: 17px;
 			}
 
 			.ash-bpc-copy-prompt {
@@ -1252,21 +1325,17 @@ Contact"
 				background: #fff;
 				color: #50575e;
 				font-size: 12px;
-				font-weight: 500;
 				cursor: pointer;
-				transition: .15s ease;
 			}
 
 			.ash-bpc-copy-prompt:hover {
-				border-color: #8c8f94;
 				background: #f6f7f7;
-				color: #1d2327;
 			}
 
 			.ash-bpc-copy-prompt.is-copied {
 				border-color: #46b450;
-				background: #f0f8f0;
 				color: #28752c;
+				background: #f0f8f0;
 			}
 
 			.ash-bpc-examples {
@@ -1288,7 +1357,6 @@ Contact"
 				border: 1px solid #dcdcde;
 				border-radius: 5px;
 				font-size: 12px;
-				color: #2c3338;
 			}
 
 			.ash-bpc-example span {
@@ -1303,13 +1371,12 @@ Contact"
 			}
 
 
-			/* =========================================================
-			 * Actions
-			 * ========================================================= */
+			/* =====================================================
+			 * BUTTONS
+			 * ===================================================== */
 
 			.ash-bpc-actions {
 				display: flex;
-				align-items: center;
 				justify-content: flex-end;
 				gap: 10px;
 				padding: 18px 24px;
@@ -1328,18 +1395,12 @@ Contact"
 				font-size: 13px;
 				font-weight: 500;
 				cursor: pointer;
-				transition: .15s ease;
 			}
 
 			.ash-bpc-preview-button {
 				background: #fff;
 				border: 1px solid #c3c4c7;
 				color: #2c3338;
-			}
-
-			.ash-bpc-preview-button:hover {
-				background: #f6f7f7;
-				border-color: #8c8f94;
 			}
 
 			.ash-bpc-create-button {
@@ -1350,18 +1411,12 @@ Contact"
 
 			.ash-bpc-create-button:hover {
 				background: #135e96;
-				border-color: #135e96;
-			}
-
-			.ash-bpc-button:disabled {
-				opacity: .55;
-				cursor: not-allowed;
 			}
 
 
-			/* =========================================================
-			 * Tree
-			 * ========================================================= */
+			/* =====================================================
+			 * TREE
+			 * ===================================================== */
 
 			.ash-bpc-tree {
 				padding: 24px;
@@ -1373,10 +1428,6 @@ Contact"
 				min-height: 43px;
 				border-bottom: 1px solid #f0f0f1;
 				font-size: 13px;
-			}
-
-			.ash-bpc-tree-row:last-child {
-				border-bottom: 0;
 			}
 
 			.ash-bpc-tree-indent {
@@ -1412,12 +1463,6 @@ Contact"
 				color: #2271b1;
 			}
 
-			.ash-bpc-tree-icon .dashicons {
-				font-size: 16px;
-				width: 16px;
-				height: 16px;
-			}
-
 			.ash-bpc-tree-title {
 				font-weight: 500;
 			}
@@ -1432,9 +1477,469 @@ Contact"
 			}
 
 
-			/* =========================================================
-			 * Result
-			 * ========================================================= */
+			/* =====================================================
+			 * EXISTING PAGE MODAL
+			 * ===================================================== */
+
+			.ash-bpc-modal-overlay {
+				position: fixed;
+				inset: 0;
+				z-index: 999999;
+				background: rgba(0,0,0,.45);
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				padding: 20px;
+			}
+
+			.ash-bpc-modal {
+				width: 100%;
+				max-width: 620px;
+				background: #fff;
+				border-radius: 12px;
+				box-shadow: 0 18px 60px rgba(0,0,0,.22);
+				overflow: hidden;
+			}
+
+			.ash-bpc-modal-header {
+				display: flex;
+				justify-content: space-between;
+				padding: 22px 24px;
+				border-bottom: 1px solid #f0f0f1;
+			}
+
+			.ash-bpc-modal-header > div:first-child {
+				position: relative;
+				padding-left: 48px;
+			}
+
+			.ash-bpc-modal-icon {
+				position: absolute;
+				left: 0;
+				top: 0;
+				width: 36px;
+				height: 36px;
+				border-radius: 8px;
+				background: #fff8e5;
+				color: #9b6a00;
+				display: flex;
+				align-items: center;
+				justify-content: center;
+			}
+
+			.ash-bpc-modal h2 {
+				margin: 0 0 4px;
+				font-size: 17px;
+			}
+
+			.ash-bpc-modal p {
+				margin: 0;
+				color: #646970;
+				font-size: 12px;
+			}
+
+			.ash-bpc-modal-close {
+				width: 32px;
+				height: 32px;
+				border: 1px solid #dcdcde;
+				background: #fff;
+				border-radius: 6px;
+				cursor: pointer;
+			}
+
+			.ash-bpc-existing-count {
+				padding: 14px 24px;
+				background: #f6f7f7;
+				font-size: 12px;
+			}
+
+			.ash-bpc-existing-count span {
+				font-weight: 700;
+				color: #2271b1;
+			}
+
+			.ash-bpc-existing-list {
+				max-height: 280px;
+				overflow-y: auto;
+				padding: 10px 24px;
+			}
+
+			.ash-bpc-existing-item {
+				display: flex;
+				align-items: center;
+				gap: 10px;
+				padding: 9px 0;
+				border-bottom: 1px solid #f0f0f1;
+				font-size: 12px;
+			}
+
+			.ash-bpc-existing-item-icon {
+				width: 27px;
+				height: 27px;
+				border-radius: 5px;
+				background: #f0f6fc;
+				color: #2271b1;
+				display: flex;
+				align-items: center;
+				justify-content: center;
+			}
+
+			.ash-bpc-existing-title {
+				font-weight: 500;
+			}
+
+			.ash-bpc-existing-url {
+				margin-left: auto;
+				color: #8c8f94;
+				font-size: 11px;
+			}
+
+			.ash-bpc-modal-actions {
+				display: grid;
+				grid-template-columns: repeat(3,1fr);
+				gap: 8px;
+				padding: 18px 24px;
+				background: #fafafa;
+				border-top: 1px solid #f0f0f1;
+			}
+
+			.ash-bpc-conflict-button {
+				min-height: 42px;
+				border-radius: 6px;
+				background: #fff;
+				cursor: pointer;
+				font-size: 13px;
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				gap: 6px;
+			}
+
+			.ash-bpc-replace {
+				border: 1px solid #2271b1;
+				color: #2271b1;
+			}
+
+			.ash-bpc-skip {
+				border: 1px solid #c3c4c7;
+				color: #50575e;
+			}
+
+			.ash-bpc-duplicate {
+				border: 1px solid #8c8f94;
+				color: #2c3338;
+			}
+
+
+			/* =====================================================
+			 * PROGRESSIVE CREATION OVERLAY
+			 * ===================================================== */
+
+			.ash-bpc-progress-overlay {
+				position: fixed;
+				inset: 0;
+				z-index: 1000000;
+				background: rgba(255,255,255,.94);
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				padding: 20px;
+			}
+
+			.ash-bpc-progress-box {
+				width: 100%;
+				max-width: 560px;
+				background: #fff;
+				border: 1px solid #dcdcde;
+				border-radius: 12px;
+				box-shadow: 0 18px 60px rgba(0,0,0,.13);
+				overflow: hidden;
+			}
+
+			.ash-bpc-progress-header {
+				display: flex;
+				align-items: center;
+				gap: 14px;
+				padding: 22px 24px;
+				border-bottom: 1px solid #f0f0f1;
+			}
+
+			.ash-bpc-progress-main-icon {
+				width: 44px;
+				height: 44px;
+				flex: 0 0 44px;
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				border-radius: 9px;
+				background: #f0f6fc;
+				color: #2271b1;
+			}
+
+			.ash-bpc-progress-main-icon .dashicons {
+				font-size: 21px;
+				width: 21px;
+				height: 21px;
+			}
+
+			.ash-bpc-progress-header h2 {
+				margin: 0 0 4px;
+				font-size: 17px;
+				font-weight: 600;
+			}
+
+			.ash-bpc-progress-header p {
+				margin: 0;
+				font-size: 12px;
+				color: #646970;
+			}
+
+			.ash-bpc-progress-steps {
+				padding: 18px 24px 12px;
+			}
+
+			.ash-bpc-progress-step {
+				position: relative;
+				display: flex;
+				align-items: center;
+				gap: 12px;
+				min-height: 48px;
+			}
+
+			.ash-bpc-step-marker {
+				width: 28px;
+				height: 28px;
+				flex: 0 0 28px;
+				border: 1px solid #dcdcde;
+				border-radius: 50%;
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				background: #fff;
+				color: #a7aaad;
+				transition: .2s ease;
+			}
+
+			.ash-bpc-step-marker .dashicons {
+				width: 14px;
+				height: 14px;
+				font-size: 14px;
+			}
+
+			.ash-bpc-step-content {
+				display: flex;
+				flex-direction: column;
+				gap: 2px;
+				min-width: 0;
+			}
+
+			.ash-bpc-step-content strong {
+				font-size: 13px;
+				font-weight: 600;
+			}
+
+			.ash-bpc-step-content span {
+				font-size: 11px;
+				color: #8c8f94;
+			}
+
+			/* Completed */
+
+			.ash-bpc-progress-step.is-complete
+			.ash-bpc-step-marker {
+				background: #46b450;
+				border-color: #46b450;
+				color: #fff;
+			}
+
+			.ash-bpc-progress-step.is-complete
+			.ash-bpc-step-content strong {
+				color: #28752c;
+			}
+
+			/* Active */
+
+			.ash-bpc-progress-step.is-active
+			.ash-bpc-step-marker {
+				border-color: #2271b1;
+				color: #2271b1;
+				box-shadow: 0 0 0 4px rgba(34,113,177,.09);
+			}
+
+			.ash-bpc-progress-step.is-active
+			.ash-bpc-step-content strong {
+				color: #2271b1;
+			}
+
+			.ash-bpc-progress-step.is-active
+			.ash-bpc-step-marker::after {
+				content: "";
+				width: 8px;
+				height: 8px;
+				border: 2px solid #2271b1;
+				border-top-color: transparent;
+				border-radius: 50%;
+				animation: ashBpcProgressSpin .7s linear infinite;
+			}
+
+			@keyframes ashBpcProgressSpin {
+				to {
+					transform: rotate(360deg);
+				}
+			}
+
+
+			/* =====================================================
+			 * INDIVIDUAL PAGE PROGRESS ITEMS
+			 * ===================================================== */
+
+			.ash-bpc-progress-pages {
+				margin: 4px 0 8px 40px;
+				max-height: 235px;
+				overflow-y: auto;
+				border-left: 1px solid #e2e4e7;
+				padding-left: 16px;
+			}
+
+			.ash-bpc-progress-page {
+				display: flex;
+				align-items: center;
+				gap: 9px;
+				min-height: 32px;
+				font-size: 12px;
+				color: #646970;
+				transition: .15s ease;
+			}
+
+			.ash-bpc-page-marker {
+				width: 19px;
+				height: 19px;
+				flex: 0 0 19px;
+				border: 1px solid #dcdcde;
+				border-radius: 50%;
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				background: #fff;
+				color: transparent;
+			}
+
+			.ash-bpc-page-marker .dashicons {
+				width: 12px;
+				height: 12px;
+				font-size: 12px;
+			}
+
+			.ash-bpc-progress-page.is-active {
+				color: #2271b1;
+				font-weight: 500;
+			}
+
+			.ash-bpc-progress-page.is-active
+			.ash-bpc-page-marker {
+				border-color: #2271b1;
+				color: #2271b1;
+				box-shadow: 0 0 0 3px rgba(34,113,177,.07);
+			}
+
+			.ash-bpc-progress-page.is-active
+			.ash-bpc-page-marker::after {
+				content: "";
+				width: 6px;
+				height: 6px;
+				border: 1.5px solid #2271b1;
+				border-top-color: transparent;
+				border-radius: 50%;
+				animation: ashBpcProgressSpin .7s linear infinite;
+			}
+
+			.ash-bpc-progress-page.is-complete {
+				color: #28752c;
+			}
+
+			.ash-bpc-progress-page.is-complete
+			.ash-bpc-page-marker {
+				background: #46b450;
+				border-color: #46b450;
+				color: #fff;
+			}
+
+			.ash-bpc-progress-page.is-skipped {
+				color: #646970;
+			}
+
+			.ash-bpc-progress-page.is-skipped
+			.ash-bpc-page-marker {
+				background: #eef6fc;
+				border-color: #72aee6;
+				color: #2271b1;
+			}
+
+			.ash-bpc-progress-page.is-replaced {
+				color: #28752c;
+			}
+
+			.ash-bpc-progress-page.is-replaced
+			.ash-bpc-page-marker {
+				background: #edfaef;
+				border-color: #46b450;
+				color: #46b450;
+			}
+
+			.ash-bpc-progress-page.is-duplicated {
+				color: #6d5515;
+			}
+
+			.ash-bpc-progress-page.is-duplicated
+			.ash-bpc-page-marker {
+				background: #fcf8ec;
+				border-color: #c8a64b;
+				color: #9b6a00;
+			}
+
+
+			/* =====================================================
+			 * PROGRESS BAR
+			 * ===================================================== */
+
+			.ash-bpc-progress-bar-wrap {
+				padding: 18px 24px 22px;
+				border-top: 1px solid #f0f0f1;
+				background: #fafafa;
+			}
+
+			.ash-bpc-progress-bar {
+				width: 100%;
+				height: 5px;
+				background: #e2e4e7;
+				border-radius: 5px;
+				overflow: hidden;
+			}
+
+			.ash-bpc-progress-bar-fill {
+				height: 100%;
+				width: 0;
+				background: #2271b1;
+				border-radius: 5px;
+				transition: width .25s ease;
+			}
+
+			.ash-bpc-progress-counter {
+				margin-top: 8px;
+				text-align: right;
+				font-size: 11px;
+				color: #646970;
+			}
+
+			.ash-bpc-progress-counter span {
+				font-weight: 600;
+				color: #2c3338;
+			}
+
+
+			/* =====================================================
+			 * RESULTS
+			 * ===================================================== */
 
 			.ash-bpc-results {
 				padding: 24px;
@@ -1445,10 +1950,6 @@ Contact"
 				border: 1px solid #dcdcde;
 				border-radius: 8px;
 				overflow: hidden;
-			}
-
-			.ash-bpc-result-section:last-child {
-				margin-bottom: 0;
 			}
 
 			.ash-bpc-result-section-header {
@@ -1474,7 +1975,8 @@ Contact"
 				border-color: #c6e1c6;
 			}
 
-			.ash-bpc-result-created .ash-bpc-result-section-header {
+			.ash-bpc-result-created
+			.ash-bpc-result-section-header {
 				background: #edfaef;
 				color: #1e4620;
 			}
@@ -1483,7 +1985,8 @@ Contact"
 				border-color: #c6e1c6;
 			}
 
-			.ash-bpc-result-replaced .ash-bpc-result-section-header {
+			.ash-bpc-result-replaced
+			.ash-bpc-result-section-header {
 				background: #edfaef;
 				color: #1e4620;
 			}
@@ -1492,7 +1995,8 @@ Contact"
 				border-color: #c5d9ed;
 			}
 
-			.ash-bpc-result-skipped .ash-bpc-result-section-header {
+			.ash-bpc-result-skipped
+			.ash-bpc-result-section-header {
 				background: #eef6fc;
 				color: #164b72;
 			}
@@ -1501,7 +2005,8 @@ Contact"
 				border-color: #e0d2ad;
 			}
 
-			.ash-bpc-result-duplicated .ash-bpc-result-section-header {
+			.ash-bpc-result-duplicated
+			.ash-bpc-result-section-header {
 				background: #fcf8ec;
 				color: #6d5515;
 			}
@@ -1510,279 +2015,16 @@ Contact"
 				border-color: #e5c7c7;
 			}
 
-			.ash-bpc-result-failed .ash-bpc-result-section-header {
+			.ash-bpc-result-failed
+			.ash-bpc-result-section-header {
 				background: #fcf0f0;
 				color: #8a2424;
 			}
 
 
-			/* =========================================================
-			 * Modal
-			 * ========================================================= */
-
-			.ash-bpc-modal-overlay {
-				position: fixed;
-				inset: 0;
-				z-index: 999999;
-				background: rgba(0,0,0,.45);
-				display: flex;
-				align-items: center;
-				justify-content: center;
-				padding: 20px;
-			}
-
-			.ash-bpc-modal {
-				width: 100%;
-				max-width: 620px;
-				background: #fff;
-				border-radius: 12px;
-				box-shadow: 0 18px 60px rgba(0,0,0,.22);
-				overflow: hidden;
-				animation: ashBpcModalIn .18s ease;
-			}
-
-			@keyframes ashBpcModalIn {
-
-				from {
-					opacity: 0;
-					transform: translateY(8px) scale(.99);
-				}
-
-				to {
-					opacity: 1;
-					transform: translateY(0) scale(1);
-				}
-
-			}
-
-			.ash-bpc-modal-header {
-				display: flex;
-				align-items: flex-start;
-				justify-content: space-between;
-				padding: 22px 24px;
-				border-bottom: 1px solid #f0f0f1;
-			}
-
-			.ash-bpc-modal-header > div:first-child {
-				position: relative;
-				padding-left: 48px;
-			}
-
-			.ash-bpc-modal-icon {
-				position: absolute;
-				left: 0;
-				top: 0;
-				width: 36px;
-				height: 36px;
-				border-radius: 8px;
-				background: #fff8e5;
-				color: #9b6a00;
-				display: flex;
-				align-items: center;
-				justify-content: center;
-			}
-
-			.ash-bpc-modal-icon .dashicons {
-				font-size: 18px;
-			}
-
-			.ash-bpc-modal h2 {
-				margin: 0 0 4px;
-				font-size: 17px;
-			}
-
-			.ash-bpc-modal p {
-				margin: 0;
-				color: #646970;
-				font-size: 12px;
-			}
-
-			.ash-bpc-modal-close {
-				width: 32px;
-				height: 32px;
-				border: 1px solid #dcdcde;
-				background: #fff;
-				border-radius: 6px;
-				display: flex;
-				align-items: center;
-				justify-content: center;
-				cursor: pointer;
-				color: #646970;
-			}
-
-			.ash-bpc-modal-close:hover {
-				background: #f6f7f7;
-				color: #1d2327;
-			}
-
-			.ash-bpc-existing-count {
-				padding: 14px 24px;
-				background: #f6f7f7;
-				font-size: 12px;
-				color: #50575e;
-				font-weight: 500;
-			}
-
-			.ash-bpc-existing-count span {
-				font-weight: 700;
-				color: #2271b1;
-			}
-
-			.ash-bpc-existing-list {
-				max-height: 280px;
-				overflow-y: auto;
-				padding: 10px 24px;
-			}
-
-			.ash-bpc-existing-item {
-				display: flex;
-				align-items: center;
-				gap: 10px;
-				padding: 9px 0;
-				border-bottom: 1px solid #f0f0f1;
-				font-size: 12px;
-			}
-
-			.ash-bpc-existing-item:last-child {
-				border-bottom: 0;
-			}
-
-			.ash-bpc-existing-item-icon {
-				width: 27px;
-				height: 27px;
-				border-radius: 5px;
-				background: #f0f6fc;
-				color: #2271b1;
-				display: flex;
-				align-items: center;
-				justify-content: center;
-				flex: 0 0 27px;
-			}
-
-			.ash-bpc-existing-item-icon .dashicons {
-				font-size: 14px;
-				width: 14px;
-				height: 14px;
-			}
-
-			.ash-bpc-existing-title {
-				font-weight: 500;
-				color: #1d2327;
-			}
-
-			.ash-bpc-existing-url {
-				margin-left: auto;
-				color: #8c8f94;
-				font-size: 11px;
-			}
-
-			.ash-bpc-modal-actions {
-				display: grid;
-				grid-template-columns: repeat(3,1fr);
-				gap: 8px;
-				padding: 18px 24px;
-				background: #fafafa;
-				border-top: 1px solid #f0f0f1;
-			}
-
-			.ash-bpc-conflict-button {
-				min-height: 42px;
-				border-radius: 6px;
-				background: #fff;
-				cursor: pointer;
-				font-size: 13px;
-				font-weight: 500;
-				display: flex;
-				align-items: center;
-				justify-content: center;
-				gap: 6px;
-			}
-
-			.ash-bpc-replace {
-				border: 1px solid #2271b1;
-				color: #2271b1;
-			}
-
-			.ash-bpc-replace:hover {
-				background: #f0f6fc;
-			}
-
-			.ash-bpc-skip {
-				border: 1px solid #c3c4c7;
-				color: #50575e;
-			}
-
-			.ash-bpc-skip:hover {
-				background: #f6f7f7;
-			}
-
-			.ash-bpc-duplicate {
-				border: 1px solid #8c8f94;
-				color: #2c3338;
-			}
-
-			.ash-bpc-duplicate:hover {
-				background: #f6f7f7;
-			}
-
-
-			/* =========================================================
-			 * Loading
-			 * ========================================================= */
-
-			.ash-bpc-loading {
-				position: fixed;
-				inset: 0;
-				z-index: 999998;
-				background: rgba(255,255,255,.78);
-				display: flex;
-				align-items: center;
-				justify-content: center;
-			}
-
-			.ash-bpc-loading-box {
-				min-width: 260px;
-				padding: 28px;
-				background: #fff;
-				border: 1px solid #dcdcde;
-				border-radius: 10px;
-				box-shadow: 0 12px 40px rgba(0,0,0,.12);
-				text-align: center;
-			}
-
-			.ash-bpc-spinner {
-				width: 30px;
-				height: 30px;
-				margin: 0 auto 14px;
-				border: 3px solid #dcdcde;
-				border-top-color: #2271b1;
-				border-radius: 50%;
-				animation: ashBpcSpin .7s linear infinite;
-			}
-
-			@keyframes ashBpcSpin {
-
-				to {
-					transform: rotate(360deg);
-				}
-
-			}
-
-			.ash-bpc-loading-box strong {
-				display: block;
-				margin-bottom: 5px;
-				font-size: 14px;
-			}
-
-			.ash-bpc-loading-box span {
-				font-size: 12px;
-				color: #646970;
-			}
-
-
-			/* =========================================================
-			 * Footer
-			 * ========================================================= */
+			/* =====================================================
+			 * FOOTER
+			 * ===================================================== */
 
 			.ash-bpc-footer {
 				display: flex;
@@ -1793,9 +2035,9 @@ Contact"
 			}
 
 
-			/* =========================================================
-			 * Responsive
-			 * ========================================================= */
+			/* =====================================================
+			 * RESPONSIVE
+			 * ===================================================== */
 
 			@media (max-width: 782px) {
 
@@ -1828,36 +2070,18 @@ Contact"
 					grid-template-columns: 1fr;
 				}
 
-				.ash-bpc-existing-url {
-					display: none;
+				.ash-bpc-progress-box {
+					max-height: calc(100vh - 40px);
+					overflow-y: auto;
+				}
+
+				.ash-bpc-progress-pages {
+					max-height: 180px;
 				}
 
 				.ash-bpc-footer {
 					flex-direction: column;
 					gap: 5px;
-				}
-			}
-
-			@media (max-width: 500px) {
-
-				.ash-bpc-help-header {
-					flex-direction: column;
-					align-items: stretch;
-				}
-
-				.ash-bpc-copy-prompt {
-					width: 100%;
-					justify-content: center;
-				}
-
-				.ash-bpc-example {
-					align-items: flex-start;
-					flex-direction: column;
-					gap: 4px;
-				}
-
-				.ash-bpc-example code {
-					width: 100%;
 				}
 			}
 
@@ -1940,19 +2164,49 @@ Contact"
 							'ash-bpc-existing-number'
 						);
 
-					const loading =
+					const progressOverlay =
 						document.getElementById(
-							'ash-bpc-loading'
+							'ash-bpc-progress-overlay'
 						);
 
-					const loadingTitle =
+					const progressPages =
 						document.getElementById(
-							'ash-bpc-loading-title'
+							'ash-bpc-progress-pages'
 						);
 
-					const loadingText =
+					const currentPage =
 						document.getElementById(
-							'ash-bpc-loading-text'
+							'ash-bpc-current-page'
+						);
+
+					const progressTitle =
+						document.getElementById(
+							'ash-bpc-progress-title'
+						);
+
+					const progressSubtitle =
+						document.getElementById(
+							'ash-bpc-progress-subtitle'
+						);
+
+					const progressNumber =
+						document.getElementById(
+							'ash-bpc-progress-number'
+						);
+
+					const progressTotal =
+						document.getElementById(
+							'ash-bpc-progress-total'
+						);
+
+					const progressBar =
+						document.getElementById(
+							'ash-bpc-progress-bar-fill'
+						);
+
+					const completedText =
+						document.getElementById(
+							'ash-bpc-completed-text'
 						);
 
 					const copyPrompt =
@@ -1963,9 +2217,23 @@ Contact"
 
 					let pendingContent = '';
 
+					let pendingItems = [];
+
+					let pendingExisting = [];
+
+					let selectedConflictAction = 'skip';
+
+					let creationResults = {
+						created: [],
+						replaced: [],
+						skipped: [],
+						duplicated: [],
+						failed: []
+					};
+
 
 					/*
-					 * Generic prompt.
+					 * Prompt.
 					 */
 					const promptText =
 `Convert the requirements I provide into a WordPress page hierarchy.
@@ -2009,7 +2277,9 @@ Now convert the requirements into this exact format.`;
 					/*
 					 * Escape HTML.
 					 */
-					function escapeHtml( value ) {
+					function escapeHtml(
+						value
+					) {
 
 						const div =
 							document.createElement(
@@ -2024,7 +2294,7 @@ Now convert the requirements into this exact format.`;
 
 
 					/*
-					 * Parse hierarchy in JavaScript.
+					 * Parse hierarchy.
 					 */
 					function parseStructure() {
 
@@ -2045,7 +2315,10 @@ Now convert the requirements into this exact format.`;
 						const items = [];
 
 						lines.forEach(
-							function( rawLine ) {
+							function(
+								rawLine,
+								lineIndex
+							) {
 
 								const line =
 									rawLine.trim();
@@ -2063,9 +2336,6 @@ Now convert the requirements into this exact format.`;
 									return;
 								}
 
-								const dashes =
-									match[1] || '';
-
 								const title =
 									(
 										match[2] || ''
@@ -2077,8 +2347,12 @@ Now convert the requirements into this exact format.`;
 
 								items.push(
 									{
+										number:
+											lineIndex + 1,
 										level:
-											dashes.length,
+											(
+												match[1] || ''
+											).length,
 										title:
 											title
 									}
@@ -2091,143 +2365,17 @@ Now convert the requirements into this exact format.`;
 
 
 					/*
-					 * Update page counter.
+					 * Counter.
 					 */
 					function updateCounter() {
 
-						const count =
-							parseStructure().length;
-
 						lineCount.textContent =
-							count;
+							parseStructure().length;
 					}
 
 
 					/*
-					 * Render tree.
-					 */
-					function renderTree() {
-
-						const items =
-							parseStructure();
-
-						tree.innerHTML =
-							'';
-
-						if ( ! items.length ) {
-
-							tree.innerHTML =
-								'<div style="padding:30px;text-align:center;color:#646970;">' +
-								'Enter your page structure first.' +
-								'</div>';
-
-							previewCard.style.display =
-								'block';
-
-							return;
-						}
-
-
-						items.forEach(
-							function( item ) {
-
-								const row =
-									document.createElement(
-										'div'
-									);
-
-								row.className =
-									'ash-bpc-tree-row';
-
-
-								let indent = '';
-
-								for (
-									let i = 0;
-									i < item.level;
-									i++
-								) {
-
-									indent +=
-										'<div class="ash-bpc-tree-branch"></div>';
-
-								}
-
-
-								row.innerHTML =
-
-									'<div class="ash-bpc-tree-indent">' +
-										indent +
-									'</div>' +
-
-									'<div class="ash-bpc-tree-icon">' +
-										'<span class="dashicons dashicons-admin-page"></span>' +
-									'</div>' +
-
-									'<div class="ash-bpc-tree-title">' +
-										escapeHtml(
-											item.title
-										) +
-									'</div>' +
-
-									'<div class="ash-bpc-tree-level">' +
-										(
-											item.level === 0
-												? 'Top level'
-												: 'Level ' +
-													item.level
-										) +
-									'</div>';
-
-								tree.appendChild(
-									row
-								);
-							}
-						);
-
-						previewCard.style.display =
-							'block';
-
-						previewCard.scrollIntoView(
-							{
-								behavior: 'smooth',
-								block: 'start'
-							}
-						);
-					}
-
-
-					/*
-					 * Show loading.
-					 */
-					function showLoading(
-						title,
-						text
-					) {
-
-						loadingTitle.textContent =
-							title;
-
-						loadingText.textContent =
-							text;
-
-						loading.style.display =
-							'flex';
-					}
-
-
-					/*
-					 * Hide loading.
-					 */
-					function hideLoading() {
-
-						loading.style.display =
-							'none';
-					}
-
-
-					/*
-					 * AJAX request helper.
+					 * AJAX helper.
 					 */
 					function ajaxRequest(
 						action,
@@ -2268,13 +2416,105 @@ Now convert the requirements into this exact format.`;
 									'Content-Type':
 										'application/x-www-form-urlencoded; charset=UTF-8'
 								},
-								body: body.toString()
+								body:
+									body.toString()
 							}
 						).then(
 							function( response ) {
 
 								return response.json();
 
+							}
+						);
+					}
+
+
+					/*
+					 * Preview tree.
+					 */
+					function renderTree() {
+
+						const items =
+							parseStructure();
+
+						tree.innerHTML = '';
+
+						if ( ! items.length ) {
+
+							tree.innerHTML =
+								'<div style="padding:30px;text-align:center;color:#646970;">Enter your page structure first.</div>';
+
+							previewCard.style.display =
+								'block';
+
+							return;
+						}
+
+
+						items.forEach(
+							function( item ) {
+
+								const row =
+									document.createElement(
+										'div'
+									);
+
+								row.className =
+									'ash-bpc-tree-row';
+
+
+								let indent = '';
+
+								for (
+									let i = 0;
+									i < item.level;
+									i++
+								) {
+
+									indent +=
+										'<div class="ash-bpc-tree-branch"></div>';
+
+								}
+
+
+								row.innerHTML =
+									'<div class="ash-bpc-tree-indent">' +
+										indent +
+									'</div>' +
+
+									'<div class="ash-bpc-tree-icon">' +
+										'<span class="dashicons dashicons-admin-page"></span>' +
+									'</div>' +
+
+									'<div class="ash-bpc-tree-title">' +
+										escapeHtml(
+											item.title
+										) +
+									'</div>' +
+
+									'<div class="ash-bpc-tree-level">' +
+										(
+											item.level === 0
+												? 'Top level'
+												: 'Level ' +
+													item.level
+										) +
+									'</div>';
+
+								tree.appendChild(
+									row
+								);
+							}
+						);
+
+
+						previewCard.style.display =
+							'block';
+
+						previewCard.scrollIntoView(
+							{
+								behavior: 'smooth',
+								block: 'start'
 							}
 						);
 					}
@@ -2307,7 +2547,6 @@ Now convert the requirements into this exact format.`;
 
 
 								row.innerHTML =
-
 									'<div class="ash-bpc-existing-item-icon">' +
 										'<span class="dashicons dashicons-admin-page"></span>' +
 									'</div>' +
@@ -2324,10 +2563,9 @@ Now convert the requirements into this exact format.`;
 												escapeHtml(
 													item.url
 												) +
-											  '</div>'
+												'</div>'
 											: ''
 									);
-
 
 								existingList.appendChild(
 									row
@@ -2358,7 +2596,301 @@ Now convert the requirements into this exact format.`;
 
 
 					/*
-					 * Create result section.
+					 * Progress helpers.
+					 */
+					function getStep(
+						id
+					) {
+
+						return document.getElementById(
+							id
+						);
+					}
+
+
+					function completeStep(
+						id,
+						text
+					) {
+
+						const step =
+							getStep( id );
+
+						if ( ! step ) {
+							return;
+						}
+
+						step.classList.remove(
+							'is-active'
+						);
+
+						step.classList.add(
+							'is-complete'
+						);
+
+
+						const marker =
+							step.querySelector(
+								'.ash-bpc-step-marker'
+							);
+
+						if ( marker ) {
+
+							marker.innerHTML =
+								'<span class="dashicons dashicons-yes"></span>';
+
+						}
+
+
+						if ( text ) {
+
+							const sub =
+								step.querySelector(
+									'.ash-bpc-step-content span'
+								);
+
+							if ( sub ) {
+								sub.textContent =
+									text;
+							}
+						}
+					}
+
+
+					function activateStep(
+						id
+					) {
+
+						const step =
+							getStep( id );
+
+						if ( ! step ) {
+							return;
+						}
+
+						step.classList.add(
+							'is-active'
+						);
+					}
+
+
+					function resetProgress() {
+
+						[
+							'ash-bpc-step-starting',
+							'ash-bpc-step-checking',
+							'ash-bpc-step-creating',
+							'ash-bpc-step-completed'
+						].forEach(
+							function( id ) {
+
+								const step =
+									getStep( id );
+
+								step.classList.remove(
+									'is-active',
+									'is-complete'
+								);
+
+								const marker =
+									step.querySelector(
+										'.ash-bpc-step-marker'
+									);
+
+								marker.innerHTML =
+									'<span class="dashicons dashicons-minus"></span>';
+
+							}
+						);
+
+
+						progressPages.innerHTML =
+							'';
+
+						progressBar.style.width =
+							'0%';
+
+						progressNumber.textContent =
+							'0';
+
+						progressTotal.textContent =
+							'0';
+
+						currentPage.textContent =
+							'Waiting...';
+
+						completedText.textContent =
+							'Waiting for creation to finish';
+					}
+
+
+					function createProgressItems(
+						items
+					) {
+
+						progressPages.innerHTML =
+							'';
+
+						items.forEach(
+							function(
+								item,
+								index
+							) {
+
+								const row =
+									document.createElement(
+										'div'
+									);
+
+								row.className =
+									'ash-bpc-progress-page';
+
+								row.dataset.index =
+									index;
+
+
+								row.innerHTML =
+									'<div class="ash-bpc-page-marker">' +
+										'<span class="dashicons"></span>' +
+									'</div>' +
+
+									'<span class="ash-bpc-page-title">' +
+										escapeHtml(
+											item.title
+										) +
+									'</span>';
+
+								progressPages.appendChild(
+									row
+								);
+							}
+						);
+					}
+
+
+					function setCurrentPage(
+						index
+					) {
+
+						const rows =
+							progressPages.querySelectorAll(
+								'.ash-bpc-progress-page'
+							);
+
+						rows.forEach(
+							function(
+								row,
+								rowIndex
+							) {
+
+								row.classList.remove(
+									'is-active'
+								);
+
+								if (
+									rowIndex ===
+									index
+								) {
+
+									row.classList.add(
+										'is-active'
+									);
+
+									row.scrollIntoView(
+										{
+											behavior:
+												'smooth',
+											block:
+												'nearest'
+										}
+									);
+								}
+							}
+						);
+
+
+						currentPage.textContent =
+							pendingItems[index]
+								? 'Creating: ' +
+									pendingItems[index].title
+								: 'Processing...';
+					}
+
+
+					function completePage(
+						index,
+						action
+					) {
+
+						const row =
+							progressPages.querySelector(
+								'[data-index="' +
+								index +
+								'"]'
+							);
+
+						if ( ! row ) {
+							return;
+						}
+
+						row.classList.remove(
+							'is-active'
+						);
+
+						row.classList.add(
+							'is-' +
+							(
+								action === 'created'
+									? 'complete'
+									: action
+							)
+						);
+
+
+						const marker =
+							row.querySelector(
+								'.ash-bpc-page-marker'
+							);
+
+						if (
+							action ===
+							'created'
+						) {
+
+							marker.innerHTML =
+								'<span class="dashicons dashicons-yes"></span>';
+
+						} else if (
+							action ===
+							'replaced'
+						) {
+
+							marker.innerHTML =
+								'<span class="dashicons dashicons-update"></span>';
+
+						} else if (
+							action ===
+							'skipped'
+						) {
+
+							marker.innerHTML =
+								'<span class="dashicons dashicons-controls-skipforward"></span>';
+
+						} else if (
+							action ===
+							'duplicated'
+						) {
+
+							marker.innerHTML =
+								'<span class="dashicons dashicons-admin-page"></span>';
+
+						}
+
+					}
+
+
+					/*
+					 * Result section.
 					 */
 					function resultSection(
 						title,
@@ -2381,7 +2913,9 @@ Now convert the requirements into this exact format.`;
 
 						html +=
 							'<div class="ash-bpc-result-section-header">' +
-							escapeHtml( title ) +
+							escapeHtml(
+								title
+							) +
 							'</div>';
 
 						html +=
@@ -2400,19 +2934,6 @@ Now convert the requirements into this exact format.`;
 										item.title
 									) +
 									'</strong>';
-
-
-								if (
-									item.parent
-								) {
-
-									html +=
-										' — Child of ' +
-										escapeHtml(
-											item.parent
-										);
-
-								}
 
 
 								if (
@@ -2449,53 +2970,28 @@ Now convert the requirements into this exact format.`;
 
 
 						html +=
-							'</ul>';
-
-						html +=
-							'</div>';
+							'</ul></div>';
 
 						return html;
 					}
 
 
-					/*
-					 * Render creation result.
-					 */
-					function renderResults(
-						data
-					) {
+					function renderResults() {
 
-						resultCard.style.display =
-							'block';
-
-
-						const created =
-							data.created || [];
-
-						const replaced =
-							data.replaced || [];
-
-						const skipped =
-							data.skipped || [];
-
-						const duplicated =
-							data.duplicated || [];
-
-						const failed =
-							data.failed || [];
-
+						const total =
+							pendingItems.length;
 
 						const processed =
-							created.length +
-							replaced.length +
-							skipped.length +
-							duplicated.length;
+							creationResults.created.length +
+							creationResults.replaced.length +
+							creationResults.skipped.length +
+							creationResults.duplicated.length;
 
 
 						resultSummary.textContent =
 							processed +
 							' of ' +
-							data.total +
+							total +
 							' pages processed successfully.';
 
 
@@ -2505,9 +3001,9 @@ Now convert the requirements into this exact format.`;
 						html +=
 							resultSection(
 								'Created (' +
-								created.length +
+								creationResults.created.length +
 								')',
-								created,
+								creationResults.created,
 								'ash-bpc-result-created'
 							);
 
@@ -2515,9 +3011,9 @@ Now convert the requirements into this exact format.`;
 						html +=
 							resultSection(
 								'Replaced (' +
-								replaced.length +
+								creationResults.replaced.length +
 								')',
-								replaced,
+								creationResults.replaced,
 								'ash-bpc-result-replaced'
 							);
 
@@ -2525,9 +3021,9 @@ Now convert the requirements into this exact format.`;
 						html +=
 							resultSection(
 								'Skipped (' +
-								skipped.length +
+								creationResults.skipped.length +
 								')',
-								skipped,
+								creationResults.skipped,
 								'ash-bpc-result-skipped'
 							);
 
@@ -2535,9 +3031,9 @@ Now convert the requirements into this exact format.`;
 						html +=
 							resultSection(
 								'Duplicated (' +
-								duplicated.length +
+								creationResults.duplicated.length +
 								')',
-								duplicated,
+								creationResults.duplicated,
 								'ash-bpc-result-duplicated'
 							);
 
@@ -2545,9 +3041,9 @@ Now convert the requirements into this exact format.`;
 						html +=
 							resultSection(
 								'Failed (' +
-								failed.length +
+								creationResults.failed.length +
 								')',
-								failed,
+								creationResults.failed,
 								'ash-bpc-result-failed'
 							);
 
@@ -2555,71 +3051,254 @@ Now convert the requirements into this exact format.`;
 						results.innerHTML =
 							html;
 
+						resultCard.style.display =
+							'block';
 
-						resultCard.scrollIntoView(
-							{
-								behavior: 'smooth',
-								block: 'start'
-							}
-						);
 					}
 
 
 					/*
-					 * Create pages.
+					 * Get parent ID for current level.
+					 *
+					 * The page immediately above this level
+					 * becomes the parent.
 					 */
-					function createPages(
-						conflictAction
+					function getParentId(
+						index
 					) {
 
-						hideConflictModal();
+						const current =
+							pendingItems[index];
 
-						showLoading(
-							'Creating Pages',
-							'Creating your page hierarchy...'
+						if (
+							! current ||
+							current.level === 0
+						) {
+							return 0;
+						}
+
+
+						for (
+							let i = index - 1;
+							i >= 0;
+							i--
+						) {
+
+							if (
+								pendingItems[i].level ===
+								current.level - 1
+							) {
+
+								return (
+									pendingItems[i]
+										.createdId || 0
+								);
+							}
+						}
+
+
+						return 0;
+					}
+
+
+					/*
+					 * Process pages ONE BY ONE.
+					 */
+					function processPage(
+						index
+					) {
+
+						if (
+							index >=
+							pendingItems.length
+						) {
+
+							finishCreation();
+
+							return;
+						}
+
+
+						setCurrentPage(
+							index
 						);
 
 
-						createButton.disabled =
-							true;
+						const item =
+							pendingItems[index];
+
+
+						const parentId =
+							getParentId(
+								index
+							);
+
+
+						/*
+						 * If a nested page cannot find its
+						 * parent, stop rather than creating
+						 * the wrong hierarchy.
+						 */
+						if (
+							item.level > 0 &&
+							! parentId
+						) {
+
+							creationResults.failed.push(
+								{
+									title:
+										item.title,
+									message:
+										'Parent page could not be determined.'
+								}
+							);
+
+							completePage(
+								index,
+								'failed'
+							);
+
+							processPage(
+								index + 1
+							);
+
+							return;
+						}
 
 
 						ajaxRequest(
-							'ash_bpc_create',
+							'ash_bpc_create_one',
 							{
-								content:
-									pendingContent,
+								title:
+									item.title,
+
+								parent_id:
+									parentId,
 
 								conflict_action:
-									conflictAction
+									selectedConflictAction
 							}
 						)
 						.then(
 							function( response ) {
 
-								hideLoading();
-
-								createButton.disabled =
-									false;
-
-
 								if (
 									! response.success
 								) {
 
-									alert(
+									const message =
 										response.data &&
 										response.data.message
 											? response.data.message
-											: 'Something went wrong.'
+											: 'Page could not be created.';
+
+
+									creationResults.failed.push(
+										{
+											title:
+												item.title,
+											message:
+												message
+										}
+									);
+
+
+									completePage(
+										index,
+										'failed'
+									);
+
+
+									processPage(
+										index + 1
 									);
 
 									return;
 								}
 
 
-								renderResults(
-									response.data
+								const data =
+									response.data;
+
+
+								/*
+								 * Store the actual created/existing
+								 * page ID.
+								 *
+								 * This is essential for nested pages.
+								 */
+								item.createdId =
+									parseInt(
+										data.id,
+										10
+									);
+
+
+								if (
+									data.action ===
+									'created'
+								) {
+
+									creationResults.created.push(
+										data
+									);
+
+								} else if (
+									data.action ===
+									'replaced'
+								) {
+
+									creationResults.replaced.push(
+										data
+									);
+
+								} else if (
+									data.action ===
+									'skipped'
+								) {
+
+									creationResults.skipped.push(
+										data
+									);
+
+								} else if (
+									data.action ===
+									'duplicated'
+								) {
+
+									creationResults.duplicated.push(
+										data
+									);
+								}
+
+
+								completePage(
+									index,
+									data.action
+								);
+
+
+								const completed =
+									index + 1;
+
+								const percentage =
+									(
+										completed /
+										pendingItems.length
+									) *
+									100;
+
+
+								progressNumber.textContent =
+									completed;
+
+								progressBar.style.width =
+									percentage +
+									'%';
+
+
+								processPage(
+									index + 1
 								);
 
 							}
@@ -2627,16 +3306,207 @@ Now convert the requirements into this exact format.`;
 						.catch(
 							function() {
 
-								hideLoading();
+								creationResults.failed.push(
+									{
+										title:
+											item.title,
+										message:
+											'Network error while creating this page.'
+									}
+								);
+
+
+								completePage(
+									index,
+									'failed'
+								);
+
+
+								processPage(
+									index + 1
+								);
+
+							}
+						);
+					}
+
+
+					/*
+					 * Finish.
+					 */
+					function finishCreation() {
+
+						currentPage.textContent =
+							'All pages processed.';
+
+						progressTitle.textContent =
+							'Creation Complete';
+
+						progressSubtitle.textContent =
+							'Your page hierarchy has been processed.';
+
+
+						completeStep(
+							'ash-bpc-step-creating',
+							'All pages processed successfully'
+						);
+
+
+						completeStep(
+							'ash-bpc-step-completed',
+							'Creation finished'
+						);
+
+
+						progressNumber.textContent =
+							pendingItems.length;
+
+						progressTotal.textContent =
+							pendingItems.length;
+
+						progressBar.style.width =
+							'100%';
+
+
+						const processed =
+							creationResults.created.length +
+							creationResults.replaced.length +
+							creationResults.skipped.length +
+							creationResults.duplicated.length;
+
+
+						completedText.textContent =
+							processed +
+							' of ' +
+							pendingItems.length +
+							' pages processed';
+
+
+						/*
+						 * Give the user a moment to see
+						 * the final completed state.
+						 */
+						setTimeout(
+							function() {
+
+								progressOverlay.style.display =
+									'none';
+
+								document.body.style.overflow =
+									'';
 
 								createButton.disabled =
 									false;
 
-								alert(
-									'The request could not be completed. Please try again.'
+								renderResults();
+
+							},
+							1000
+						);
+					}
+
+
+					/*
+					 * Start actual progressive creation.
+					 */
+					function startCreation(
+						action
+					) {
+
+						selectedConflictAction =
+							action;
+
+						hideConflictModal();
+
+						pendingItems =
+							parseStructure();
+
+						creationResults = {
+							created: [],
+							replaced: [],
+							skipped: [],
+							duplicated: [],
+							failed: []
+						};
+
+
+						if (
+							! pendingItems.length
+						) {
+							return;
+						}
+
+
+						resetProgress();
+
+						createProgressItems(
+							pendingItems
+						);
+
+
+						progressTotal.textContent =
+							pendingItems.length;
+
+
+						progressOverlay.style.display =
+							'flex';
+
+						document.body.style.overflow =
+							'hidden';
+
+
+						/*
+						 * Starting.
+						 */
+						activateStep(
+							'ash-bpc-step-starting'
+						);
+
+
+						setTimeout(
+							function() {
+
+								completeStep(
+									'ash-bpc-step-starting',
+									'Page structure ready'
 								);
 
-							}
+
+								/*
+								 * Checking.
+								 */
+								activateStep(
+									'ash-bpc-step-checking'
+								);
+
+
+								setTimeout(
+									function() {
+
+										completeStep(
+											'ash-bpc-step-checking',
+											'Existing page check complete'
+										);
+
+
+										/*
+										 * Creating.
+										 */
+										activateStep(
+											'ash-bpc-step-creating'
+										);
+
+
+										processPage(
+											0
+										);
+
+									},
+									250
+								);
+
+							},
+							250
 						);
 					}
 
@@ -2664,30 +3534,18 @@ Now convert the requirements into this exact format.`;
 							}
 
 
-							const total =
-								parseStructure().length;
-
-
-							if ( ! total ) {
-
-								alert(
-									'No valid pages were found.'
-								);
-
-								return;
-							}
-
-
 							pendingContent =
 								textarea.value;
 
 
-							showLoading(
-								'Checking Pages',
-								'Checking for existing pages...'
-							);
+							createButton.disabled =
+								true;
 
 
+							/*
+							 * Preflight is deliberately
+							 * separate from actual creation.
+							 */
 							ajaxRequest(
 								'ash_bpc_preflight',
 								{
@@ -2698,7 +3556,8 @@ Now convert the requirements into this exact format.`;
 							.then(
 								function( response ) {
 
-									hideLoading();
+									createButton.disabled =
+										false;
 
 
 									if (
@@ -2716,20 +3575,24 @@ Now convert the requirements into this exact format.`;
 									}
 
 
-									const data =
-										response.data;
+									pendingItems =
+										response.data.items ||
+										[];
+
+									pendingExisting =
+										response.data.existing ||
+										[];
 
 
 									/*
-									 * No existing pages:
-									 * create immediately.
+									 * No conflicts:
+									 * immediately start.
 									 */
 									if (
-										! data.existing ||
-										! data.existing.length
+										! pendingExisting.length
 									) {
 
-										createPages(
+										startCreation(
 											'skip'
 										);
 
@@ -2738,11 +3601,11 @@ Now convert the requirements into this exact format.`;
 
 
 									/*
-									 * Existing pages found:
-									 * show modal.
+									 * Conflicts:
+									 * show choice modal.
 									 */
 									showConflictModal(
-										data.existing
+										pendingExisting
 									);
 
 								}
@@ -2750,7 +3613,8 @@ Now convert the requirements into this exact format.`;
 							.catch(
 								function() {
 
-									hideLoading();
+									createButton.disabled =
+										false;
 
 									alert(
 										'The request could not be completed. Please try again.'
@@ -2777,7 +3641,7 @@ Now convert the requirements into this exact format.`;
 									'click',
 									function() {
 
-										createPages(
+										startCreation(
 											button.dataset.action
 										);
 
@@ -2797,9 +3661,6 @@ Now convert the requirements into this exact format.`;
 					);
 
 
-					/*
-					 * Close modal by clicking overlay.
-					 */
 					conflictModal.addEventListener(
 						'click',
 						function( event ) {
@@ -2807,26 +3668,6 @@ Now convert the requirements into this exact format.`;
 							if (
 								event.target ===
 								conflictModal
-							) {
-
-								hideConflictModal();
-
-							}
-
-						}
-					);
-
-
-					/*
-					 * Escape key.
-					 */
-					document.addEventListener(
-						'keydown',
-						function( event ) {
-
-							if (
-								'Escape' ===
-								event.key
 							) {
 
 								hideConflictModal();
@@ -2981,7 +3822,27 @@ Now convert the requirements into this exact format.`;
 
 
 					/*
-					 * Initial counter.
+					 * Escape key.
+					 */
+					document.addEventListener(
+						'keydown',
+						function( event ) {
+
+							if (
+								event.key ===
+								'Escape'
+							) {
+
+								hideConflictModal();
+
+							}
+
+						}
+					);
+
+
+					/*
+					 * Initial count.
 					 */
 					updateCounter();
 
@@ -2996,6 +3857,6 @@ Now convert the requirements into this exact format.`;
 
 
 /**
- * Initialize.
+ * Initialize plugin.
  */
 new Ash_Bulk_Page_Creation();
